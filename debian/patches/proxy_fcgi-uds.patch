@@ -1,0 +1,365 @@
+--- a/modules/proxy/mod_proxy.h
++++ b/modules/proxy/mod_proxy.h
+@@ -232,6 +232,7 @@
+                                 * that is used over the backend connection. */
+     proxy_worker *worker;      /* Connection pool this connection belongs to */
+     apr_pool_t   *pool;        /* Subpool for hostname and addr data */
++    const char   *uds_path;    /* Unix domain socket path */
+     const char   *hostname;
+     apr_sockaddr_t *addr;      /* Preparsed remote address info */
+     apr_pool_t   *scpool;      /* Subpool used for socket and connection data */
+@@ -303,9 +304,9 @@
+ #define PROXY_WORKER_MAX_SCHEME_SIZE    16
+ #define PROXY_WORKER_MAX_ROUTE_SIZE     64
+ #define PROXY_BALANCER_MAX_ROUTE_SIZE PROXY_WORKER_MAX_ROUTE_SIZE
+-#define PROXY_WORKER_MAX_NAME_SIZE      96
++#define PROXY_WORKER_MAX_NAME_SIZE      368
+ #define PROXY_BALANCER_MAX_NAME_SIZE PROXY_WORKER_MAX_NAME_SIZE
+-#define PROXY_WORKER_MAX_HOSTNAME_SIZE  64
++#define PROXY_WORKER_MAX_HOSTNAME_SIZE  336
+ #define PROXY_BALANCER_MAX_HOSTNAME_SIZE PROXY_WORKER_MAX_HOSTNAME_SIZE
+ #define PROXY_BALANCER_MAX_STICKY_SIZE  64
+ 
+--- a/modules/proxy/proxy_util.c
++++ b/modules/proxy/proxy_util.c
+@@ -31,6 +31,12 @@
+ #define apr_socket_create apr_socket_create_ex
+ #endif
+ 
++#define HAVE_AF_UNIX 1
++#if HAVE_AF_UNIX
++#include <sys/un.h>
++#include "apr_support.h"        /* for apr_wait_for_io_or_timeout() */
++#endif
++
+ APLOG_USE_MODULE(proxy);
+ 
+ /*
+@@ -2015,6 +2021,7 @@
+     (*conn)->worker = worker;
+     (*conn)->close  = 0;
+     (*conn)->inreslist = 0;
++    (*conn)->uds_path = NULL;
+ 
+     return OK;
+ }
+@@ -2031,6 +2038,30 @@
+     return OK;
+ }
+ 
++/*
++ * Decodes a '%' escaped string, and returns the number of characters
++ */
++static int decodeenc(char *x)
++{
++    int i, j, ch;
++
++    if (x[0] == '\0') {
++        /* special case for no characters */
++        return 0;
++    }
++    for (i = 0, j = 0; x[i] != '\0'; i++, j++) {
++        /* decode it if not already done */
++        ch = x[i];
++        if (ch == '%' && apr_isxdigit(x[i + 1]) && apr_isxdigit(x[i + 2])) {
++            ch = ap_proxy_hex2c(&x[i + 1]);
++            i += 2;
++        }
++        x[j] = ch;
++    }
++    x[j] = '\0';
++    return j;
++}
++
+ PROXY_DECLARE(int)
+ ap_proxy_determine_connection(apr_pool_t *p, request_rec *r,
+                               proxy_server_conf *conf,
+@@ -2125,10 +2156,17 @@
+             conn->port = uri->port;
+         }
+         socket_cleanup(conn);
+-        err = apr_sockaddr_info_get(&(conn->addr),
+-                                    conn->hostname, APR_UNSPEC,
+-                                    conn->port, 0,
+-                                    conn->pool);
++        if (strncmp(conn->hostname, "socket=", 7) == 0) {
++            char *uds_path = apr_pstrdup(conn->pool, conn->hostname + 7);
++            decodeenc(uds_path);
++            conn->uds_path = uds_path;
++        }
++        else {
++            err = apr_sockaddr_info_get(&(conn->addr),
++                                        conn->hostname, APR_UNSPEC,
++                                        conn->port, 0,
++                                        conn->pool);
++        }
+     }
+     else if (!worker->cp->addr) {
+         if ((err = PROXY_THREAD_LOCK(worker)) != APR_SUCCESS) {
+@@ -2353,6 +2391,50 @@
+ }
+ 
+ 
++/* lifted from mod_proxy_fdpass.c; tweaked addrlen in connect() call */
++static apr_status_t socket_connect_un(apr_socket_t *sock,
++                                      struct sockaddr_un *sa)
++{
++    apr_status_t rv;
++    apr_os_sock_t rawsock;
++    apr_interval_time_t t;
++
++    rv = apr_os_sock_get(&rawsock, sock);
++    if (rv != APR_SUCCESS) {
++        return rv;
++    }
++
++    rv = apr_socket_timeout_get(sock, &t);
++    if (rv != APR_SUCCESS) {
++        return rv;
++    }
++
++    do {
++        const socklen_t addrlen = strlen(sa->sun_path)
++                                  + sizeof(sa->sun_family);
++        rv = connect(rawsock, (struct sockaddr*)sa, addrlen);
++    } while (rv == -1 && errno == EINTR);
++
++    if ((rv == -1) && (errno == EINPROGRESS || errno == EALREADY)
++        && (t > 0)) {
++#if APR_MAJOR_VERSION < 2
++        rv = apr_wait_for_io_or_timeout(NULL, sock, 0);
++#else
++        rv = apr_socket_wait(sock, APR_WAIT_WRITE);
++#endif
++
++        if (rv != APR_SUCCESS) {
++            return rv;
++        }
++    }
++
++    if (rv == -1 && errno != EISCONN) {
++        return errno;
++    }
++
++    return APR_SUCCESS;
++}
++
+ PROXY_DECLARE(int) ap_proxy_connect_backend(const char *proxy_function,
+                                             proxy_conn_rec *conn,
+                                             proxy_worker *worker,
+@@ -2377,93 +2459,127 @@
+                          proxy_function);
+         }
+     }
+-    while (backend_addr && !connected) {
+-        if ((rv = apr_socket_create(&newsock, backend_addr->family,
+-                                SOCK_STREAM, APR_PROTO_TCP,
+-                                conn->scpool)) != APR_SUCCESS) {
+-            loglevel = backend_addr->next ? APLOG_DEBUG : APLOG_ERR;
+-            ap_log_error(APLOG_MARK, loglevel, rv, s, APLOGNO(00952)
+-                         "%s: error creating fam %d socket for target %s",
+-                         proxy_function,
+-                         backend_addr->family,
+-                         worker->s->hostname);
+-            /*
+-             * this could be an IPv6 address from the DNS but the
+-             * local machine won't give us an IPv6 socket; hopefully the
+-             * DNS returned an additional address to try
+-             */
+-            backend_addr = backend_addr->next;
+-            continue;
+-        }
+-        conn->connection = NULL;
++    while ((backend_addr || conn->uds_path) && !connected) {
++        if (conn->uds_path) {
++            struct sockaddr_un sa;
+ 
+-        if (worker->s->recv_buffer_size > 0 &&
+-            (rv = apr_socket_opt_set(newsock, APR_SO_RCVBUF,
+-                                     worker->s->recv_buffer_size))) {
+-            ap_log_error(APLOG_MARK, APLOG_ERR, rv, s, APLOGNO(00953)
+-                         "apr_socket_opt_set(SO_RCVBUF): Failed to set "
+-                         "ProxyReceiveBufferSize, using default");
+-        }
++            rv = apr_socket_create(&newsock, AF_UNIX, SOCK_STREAM, 0,
++                                   conn->scpool);
++            if (rv != APR_SUCCESS) {
++                loglevel = APLOG_ERR;
++                ap_log_error(APLOG_MARK, loglevel, rv, s, APLOGNO()
++                             "%s: error creating Unix domain socket for "
++                             "target %s",
++                             proxy_function,
++                             worker->s->hostname);
++                break;
++            }
++            conn->connection = NULL;
+ 
+-        rv = apr_socket_opt_set(newsock, APR_TCP_NODELAY, 1);
+-        if (rv != APR_SUCCESS && rv != APR_ENOTIMPL) {
+-             ap_log_error(APLOG_MARK, APLOG_ERR, rv, s, APLOGNO(00954)
+-                          "apr_socket_opt_set(APR_TCP_NODELAY): "
+-                          "Failed to set");
+-        }
++            sa.sun_family = AF_UNIX;
++            apr_cpystrn(sa.sun_path, conn->uds_path, sizeof(sa.sun_path));
+ 
+-        /* Set a timeout for connecting to the backend on the socket */
+-        if (worker->s->conn_timeout_set) {
+-            apr_socket_timeout_set(newsock, worker->s->conn_timeout);
+-        }
+-        else if (worker->s->timeout_set) {
+-            apr_socket_timeout_set(newsock, worker->s->timeout);
+-        }
+-        else if (conf->timeout_set) {
+-            apr_socket_timeout_set(newsock, conf->timeout);
+-        }
+-        else {
+-             apr_socket_timeout_set(newsock, s->timeout);
+-        }
+-        /* Set a keepalive option */
+-        if (worker->s->keepalive) {
+-            if ((rv = apr_socket_opt_set(newsock,
+-                            APR_SO_KEEPALIVE, 1)) != APR_SUCCESS) {
+-                ap_log_error(APLOG_MARK, APLOG_ERR, rv, s, APLOGNO(00955)
+-                             "apr_socket_opt_set(SO_KEEPALIVE): Failed to set"
+-                             " Keepalive");
+-            }
+-        }
+-        ap_log_error(APLOG_MARK, APLOG_TRACE2, 0, s,
+-                     "%s: fam %d socket created to connect to %s",
+-                     proxy_function, backend_addr->family, worker->s->hostname);
+-
+-        if (conf->source_address_set) {
+-            local_addr = apr_pmemdup(conn->pool, conf->source_address,
+-                                     sizeof(apr_sockaddr_t));
+-            local_addr->pool = conn->pool;
+-            rv = apr_socket_bind(newsock, local_addr);
++            rv = socket_connect_un(newsock, &sa);
+             if (rv != APR_SUCCESS) {
+-                ap_log_error(APLOG_MARK, APLOG_ERR, rv, s, APLOGNO(00956)
+-                    "%s: failed to bind socket to local address",
+-                    proxy_function);
++                apr_socket_close(newsock);
++                ap_log_error(APLOG_MARK, APLOG_ERR, rv, s, APLOGNO()
++                             "%s: attempt to connect to Unix domain socket "
++                             "%s (%s) failed",
++                             proxy_function,
++                             conn->uds_path,
++                             worker->s->hostname);
++                break;
+             }
+         }
++        else {
++            if ((rv = apr_socket_create(&newsock, backend_addr->family,
++                                        SOCK_STREAM, APR_PROTO_TCP,
++                                        conn->scpool)) != APR_SUCCESS) {
++                loglevel = backend_addr->next ? APLOG_DEBUG : APLOG_ERR;
++                ap_log_error(APLOG_MARK, loglevel, rv, s, APLOGNO(00952)
++                             "%s: error creating fam %d socket for "
++                             "target %s",
++                             proxy_function,
++                             backend_addr->family,
++                             worker->s->hostname);
++                /*
++                 * this could be an IPv6 address from the DNS but the
++                 * local machine won't give us an IPv6 socket; hopefully the
++                 * DNS returned an additional address to try
++                 */
++                backend_addr = backend_addr->next;
++                continue;
++            }
++            conn->connection = NULL;
+ 
+-        /* make the connection out of the socket */
+-        rv = apr_socket_connect(newsock, backend_addr);
++            if (worker->s->recv_buffer_size > 0 &&
++                (rv = apr_socket_opt_set(newsock, APR_SO_RCVBUF,
++                                         worker->s->recv_buffer_size))) {
++                ap_log_error(APLOG_MARK, APLOG_ERR, rv, s, APLOGNO(00953)
++                             "apr_socket_opt_set(SO_RCVBUF): Failed to set "
++                             "ProxyReceiveBufferSize, using default");
++            }
+ 
+-        /* if an error occurred, loop round and try again */
+-        if (rv != APR_SUCCESS) {
+-            apr_socket_close(newsock);
+-            loglevel = backend_addr->next ? APLOG_DEBUG : APLOG_ERR;
+-            ap_log_error(APLOG_MARK, loglevel, rv, s, APLOGNO(00957)
+-                         "%s: attempt to connect to %pI (%s) failed",
+-                         proxy_function,
+-                         backend_addr,
+-                         worker->s->hostname);
+-            backend_addr = backend_addr->next;
+-            continue;
++            rv = apr_socket_opt_set(newsock, APR_TCP_NODELAY, 1);
++            if (rv != APR_SUCCESS && rv != APR_ENOTIMPL) {
++                ap_log_error(APLOG_MARK, APLOG_ERR, rv, s, APLOGNO(00954)
++                             "apr_socket_opt_set(APR_TCP_NODELAY): "
++                             "Failed to set");
++            }
++
++            /* Set a timeout for connecting to the backend on the socket */
++            if (worker->s->conn_timeout_set) {
++                apr_socket_timeout_set(newsock, worker->s->conn_timeout);
++            }
++            else if (worker->s->timeout_set) {
++                apr_socket_timeout_set(newsock, worker->s->timeout);
++            }
++            else if (conf->timeout_set) {
++                apr_socket_timeout_set(newsock, conf->timeout);
++            }
++            else {
++                apr_socket_timeout_set(newsock, s->timeout);
++            }
++            /* Set a keepalive option */
++            if (worker->s->keepalive) {
++                if ((rv = apr_socket_opt_set(newsock,
++                                             APR_SO_KEEPALIVE, 1)) != APR_SUCCESS) {
++                    ap_log_error(APLOG_MARK, APLOG_ERR, rv, s, APLOGNO(00955)
++                                 "apr_socket_opt_set(SO_KEEPALIVE): Failed to set"
++                                 " Keepalive");
++                }
++            }
++            ap_log_error(APLOG_MARK, APLOG_TRACE2, 0, s,
++                         "%s: fam %d socket created to connect to %s",
++                         proxy_function, backend_addr->family, worker->s->hostname);
++
++            if (conf->source_address_set) {
++                local_addr = apr_pmemdup(conn->pool, conf->source_address,
++                                         sizeof(apr_sockaddr_t));
++                local_addr->pool = conn->pool;
++                rv = apr_socket_bind(newsock, local_addr);
++                if (rv != APR_SUCCESS) {
++                    ap_log_error(APLOG_MARK, APLOG_ERR, rv, s, APLOGNO(00956)
++                                 "%s: failed to bind socket to local address",
++                                 proxy_function);
++                }
++            }
++
++            /* make the connection out of the socket */
++            rv = apr_socket_connect(newsock, backend_addr);
++
++            /* if an error occurred, loop round and try again */
++            if (rv != APR_SUCCESS) {
++                apr_socket_close(newsock);
++                loglevel = backend_addr->next ? APLOG_DEBUG : APLOG_ERR;
++                ap_log_error(APLOG_MARK, loglevel, rv, s, APLOGNO(00957)
++                             "%s: attempt to connect to %pI (%s) failed",
++                             proxy_function,
++                             backend_addr,
++                             worker->s->hostname);
++                backend_addr = backend_addr->next;
++                continue;
++            }
+         }
+ 
+         /* Set a timeout on the socket */
+@@ -2479,7 +2595,7 @@
+ 
+         conn->sock = newsock;
+ 
+-        if (conn->forward) {
++        if (!conn->uds_path && conn->forward) {
+             forward_info *forward = (forward_info *)conn->forward;
+             /*
+              * For HTTP CONNECT we need to prepend CONNECT request before
